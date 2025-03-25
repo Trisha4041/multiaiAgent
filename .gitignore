@@ -1,0 +1,9 @@
+# Ignore sensitive credential files
+calender-bot-backend/credentials.json
+calender-bot-backend/calendar-bot-key.json
+calender-bot-backend/credentials2.json
+calender-bot-backend/token.json
+
+email-bot-backend/credentials.json
+email-bot-backend/credentials2.json
+email-bot-backend/token.json
