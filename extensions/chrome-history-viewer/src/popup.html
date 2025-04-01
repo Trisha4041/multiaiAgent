@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Chrome History Explorer</title>
+    <style>
+        body {
+            width: 500px;
+            font-family: Arial, sans-serif;
+            padding: 15px;
+            background-color: #f9f9f9;
+        }
+        h2 {
+            text-align: center;
+            margin-bottom: 15px;
+        }
+        #history-list {
+            max-height: 400px;
+            overflow-y: auto;
+            background: white;
+            padding: 10px;
+            border-radius: 5px;
+            box-shadow: 0px 0px 5px rgba(0, 0, 0, 0.1);
+        }
+        .history-item {
+            border-bottom: 1px solid #ddd;
+            padding: 10px 5px;
+            transition: background 0.3s;
+        }
+        .history-item:hover {
+            background-color: #f0f0f0;
+        }
+        input, select, button {
+            padding: 8px;
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            width: 100%;
+        }
+        button {
+            cursor: pointer;
+            background-color: #007bff;
+            color: white;
+            font-weight: bold;
+            border: none;
+            transition: 0.3s;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .action-section {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+        .action-section button {
+            flex: 1;
+        }
+    </style>
+</head>
+<body>
+    <h2>🕵️ Chrome History Explorer</h2>
+    
+    <div class="action-section">
+        <select id="time-range">
+            <option value="1">Last 1 Day</option>
+            <option value="7" selected>Last 7 Days</option>
+            <option value="30">Last 30 Days</option>
+        </select>
+        <input type="text" id="search-input" placeholder="Search history...">
+        <button id="search-btn">🔍 Search</button>
+    </div>
+
+    <div class="action-section">
+        <button id="export-csv">📄 Export CSV</button>
+        <button id="clear-filters">🔄 Reset</button>
+    </div>
+
+    <div id="history-list"></div>
+
+    <script src="popup.js"></script>
+</body>
+</html>

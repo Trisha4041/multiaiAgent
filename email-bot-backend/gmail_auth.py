@@ -6,7 +6,7 @@ from google.oauth2.credentials import Credentials
 flow = InstalledAppFlow.from_client_secrets_file(
     'credentials2.json', 
     ['https://www.googleapis.com/auth/gmail.send', 
-     'https://www.googleapis.com/auth/gmail.readonly']
+     'https://www.googleapis.com/auth/gmail.readonly']  
 )
 
 # Run the local server to get credentials

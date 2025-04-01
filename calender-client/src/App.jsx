@@ -1,5 +1,5 @@
 import React from 'react'
-import CalenderBot from "@/componentsC/CalenderBot";
+import CalenderBot from "./componentsC/CalenderBot";
 
 const App = () => {
   return (
