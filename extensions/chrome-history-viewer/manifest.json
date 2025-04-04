@@ -1,18 +1,28 @@
 {
   "manifest_version": 3,
   "name": "Chrome History Viewer",
-  "version": "1.0",
+  "version": "1.2",
   "description": "A Chrome extension to view and export browser history",
   "permissions": ["history", "storage"],
+  "host_permissions": ["<all_urls>"],
   "background": {
-    "service_worker": "src/background.js"
+    "service_worker": "src/background.js",
+    "type": "module"
   },
   "action": {
-    "default_popup": "src/popup.html"
+    "default_popup": "src/popup.html",
+    "default_icon": {
+      "16": "src/icon.png",
+      "48": "src/icon.png",
+      "128": "src/icon.png"
+    }
   },
   "icons": {
-    "16": "icon.png",
-    "48": "icon.png",
-    "128": "icon.png"
+    "16": "src/icon.png",
+    "48": "src/icon.png",
+    "128": "src/icon.png"
+  },
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'"
   }
 }

@@ -6,83 +6,57 @@ document.addEventListener('DOMContentLoaded', () => {
     const exportCsvBtn = document.getElementById('export-csv');
     const clearFiltersBtn = document.getElementById('clear-filters');
 
-    // Fetch history items based on time range & search term
-    async function fetchHistory(timeRange, searchTerm = '') {
-        try {
-            const millisecondsPerDay = 24 * 60 * 60 * 1000;
-            const startTime = Date.now() - (timeRange * millisecondsPerDay);
+    function fetchHistory(timeRange, searchTerm = '') {
+        const millisecondsPerDay = 24 * 60 * 60 * 1000;
+        const startTime = Date.now() - (timeRange * millisecondsPerDay);
 
-            chrome.history.search(
-                { text: searchTerm, startTime, maxResults: 500 },
-                (historyItems) => {
-                    if (chrome.runtime.lastError) {
-                        console.error("Error fetching history:", chrome.runtime.lastError);
-                        return;
-                    }
-                    displayHistory(historyItems);
-                }
-            );
-        } catch (error) {
-            console.error("Fetch history failed:", error);
-        }
+        chrome.history.search({
+            text: searchTerm,
+            startTime: startTime,
+            maxResults: 500
+        }, (historyItems) => {
+            displayHistory(historyItems);
+        });
     }
 
-    // Display history in the popup
     function displayHistory(historyItems) {
-        historyList.innerHTML = ''; // Clear previous results
-
-        if (historyItems.length === 0) {
-            historyList.innerHTML = "<p>No history found.</p>";
-            return;
+        // Clear the history list using DOM methods instead of innerHTML
+        while (historyList.firstChild) {
+            historyList.removeChild(historyList.firstChild);
         }
-
-        const fragment = document.createDocumentFragment(); // Improve performance
+        
         historyItems.sort((a, b) => b.lastVisitTime - a.lastVisitTime);
-
+        
         historyItems.forEach(item => {
             const historyItemDiv = document.createElement('div');
             historyItemDiv.classList.add('history-item');
-
-            const visitDate = new Date(item.lastVisitTime).toLocaleString();
-            historyItemDiv.innerHTML = `
-                <strong>${item.title || 'Untitled'}</strong><br>
-                <small>${visitDate}</small><br>
-                <a href="${item.url}" target="_blank">${item.url}</a>
-            `;
-
-            fragment.appendChild(historyItemDiv);
+            
+            const title = document.createElement('strong');
+            title.textContent = item.title || 'Untitled';
+            
+            const lineBreak1 = document.createElement('br');
+            
+            const dateSmall = document.createElement('small');
+            const visitDate = new Date(item.lastVisitTime);
+            dateSmall.textContent = visitDate.toLocaleString();
+            
+            const lineBreak2 = document.createElement('br');
+            
+            const link = document.createElement('a');
+            link.href = item.url;
+            link.target = '_blank';
+            link.textContent = item.url;
+            
+            historyItemDiv.appendChild(title);
+            historyItemDiv.appendChild(lineBreak1);
+            historyItemDiv.appendChild(dateSmall);
+            historyItemDiv.appendChild(lineBreak2);
+            historyItemDiv.appendChild(link);
+            
+            historyList.appendChild(historyItemDiv);
         });
-
-        historyList.appendChild(fragment);
     }
 
-    // Convert history items to CSV format
-    function convertToCSV(historyItems) {
-        const headers = ['Title', 'URL', 'Visit Time'];
-        const rows = historyItems.map(item => [
-            `"${item.title?.replace(/"/g, '""') || 'Untitled'}"`,
-            `"${item.url}"`,
-            `"${new Date(item.lastVisitTime).toLocaleString()}"`
-        ]);
-
-        return [headers, ...rows]
-            .map(row => row.join(','))
-            .join('\n');
-    }
-
-    // Download CSV file
-    function downloadCSV(csvContent) {
-        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-        const link = document.createElement('a');
-        link.href = URL.createObjectURL(blob);
-        link.download = `chrome_history_${new Date().toISOString().split('T')[0]}.csv`;
-        link.style.display = 'none';
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-    }
-
-    // Event Listeners
     timeRangeSelect.addEventListener('change', () => {
         fetchHistory(parseInt(timeRangeSelect.value));
     });
@@ -91,11 +65,22 @@ document.addEventListener('DOMContentLoaded', () => {
         fetchHistory(parseInt(timeRangeSelect.value), searchInput.value.trim());
     });
 
+    // Add enter key support for search
+    searchInput.addEventListener('keyup', (event) => {
+        if (event.key === 'Enter') {
+            fetchHistory(parseInt(timeRangeSelect.value), searchInput.value.trim());
+        }
+    });
+
     exportCsvBtn.addEventListener('click', () => {
-        chrome.history.search(
-            { text: '', startTime: Date.now() - (parseInt(timeRangeSelect.value) * 24 * 60 * 60 * 1000), maxResults: 1000 },
-            (historyItems) => downloadCSV(convertToCSV(historyItems))
-        );
+        chrome.history.search({
+            text: '',
+            startTime: Date.now() - (parseInt(timeRangeSelect.value) * 24 * 60 * 60 * 1000),
+            maxResults: 1000
+        }, (historyItems) => {
+            const csvContent = convertToCSV(historyItems);
+            downloadCSV(csvContent);
+        });
     });
 
     clearFiltersBtn.addEventListener('click', () => {
@@ -104,6 +89,37 @@ document.addEventListener('DOMContentLoaded', () => {
         fetchHistory(7);
     });
 
-    // Initial history load
+    function convertToCSV(historyItems) {
+        const headers = ['Title', 'URL', 'Visit Time'];
+        const rows = historyItems.map(item => {
+            // Safely handle null/undefined title
+            const title = (item.title || 'Untitled').replace(/"/g, '""');
+            return [
+                `"${title}"`,
+                `"${item.url}"`,
+                `"${new Date(item.lastVisitTime).toLocaleString()}"`
+            ];
+        });
+        return [headers, ...rows].map(row => row.join(',')).join('\n');
+    }
+
+    function downloadCSV(csvContent) {
+        const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+        const url = URL.createObjectURL(blob);
+        
+        const link = document.createElement('a');
+        link.href = url;
+        link.download = `chrome_history_${new Date().toISOString().split('T')[0]}.csv`;
+        document.body.appendChild(link);
+        link.click();
+        
+        // Clean up
+        setTimeout(() => {
+            document.body.removeChild(link);
+            URL.revokeObjectURL(url);
+        }, 100);
+    }
+
+    // Initialize with 7-day history
     fetchHistory(7);
 });
