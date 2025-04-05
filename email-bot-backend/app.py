@@ -1,51 +1,46 @@
 import os
 import base64
 import json
-import requests
 import logging
+import re
+from datetime import datetime, timedelta
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Form, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, status, Depends
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Tuple
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+import httpx
+import time
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, 
-                   format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+# Configure logging and silence discovery_cache warnings
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logging.getLogger('googleapiclient.discovery_cache').setLevel(logging.ERROR)
 logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
-
-# Ensure API Key is set
 TOGETHER_API_KEY = os.getenv("TOGETHER_API_KEY")
-if not TOGETHER_API_KEY:
-    logger.error("Together AI API key is missing. Set it in your environment variables.")
-    raise RuntimeError("Together AI API key is missing. Set it in your environment variables.")
 
-# Authenticate Gmail API
-try:
-    creds = Credentials.from_authorized_user_file(
-        "token.json",
-        scopes=["https://www.googleapis.com/auth/gmail.send", "https://www.googleapis.com/auth/gmail.readonly"]
-    )
-    gmail_service = build("gmail", "v1", credentials=creds)
-    logger.info("Gmail API authentication successful")
-except Exception as e:
-    logger.error(f"Failed to authenticate Gmail API: {e}")
-    raise RuntimeError(f"Failed to authenticate Gmail API: {e}")
-
-# FastAPI App
-app = FastAPI(title="Email Assistant API")
+# Initialize FastAPI app
+app = FastAPI(
+    title="Email Assistant API",
+    version="1.0.0",
+    description="API for managing emails and calendar events"
+)
 
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update this with your frontend URL in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,325 +50,271 @@ app.add_middleware(
 class EmailRequest(BaseModel):
     to: str
     subject: str
-    body: Optional[str] = None
+    body: str
 
 class GenerateEmailRequest(BaseModel):
     subject: str
-    email_history: Optional[List[str]] = []
+    email_history: Optional[List[str]] = None
 
-# Global error handler
-@app.middleware("http")
-async def catch_exceptions_middleware(request: Request, call_next):
+class MarkAsReadRequest(BaseModel):
+    message_id: str
+
+class CreateEventRequest(BaseModel):
+    summary: str
+    description: Optional[str] = None
+    start_datetime: str
+    end_datetime: str
+    attendees: Optional[List[str]] = None
+
+# Global variables for services
+gmail_service = None
+calendar_service = None
+
+# Initialize Gmail and Calendar services
+def get_services() -> Tuple:
+    global gmail_service, calendar_service
+    if gmail_service and calendar_service:
+        return gmail_service, calendar_service
     try:
-        return await call_next(request)
-    except Exception as e:
-        logger.error(f"Unhandled exception: {str(e)}")
-        return JSONResponse(
-            status_code=500,
-            content={"detail": f"Internal server error: {str(e)}"}
+        token_path = "token.json"
+        if not os.path.exists(token_path):
+            logger.error(f"Token file not found at {token_path}")
+            raise FileNotFoundError(f"Authentication token file not found: {token_path}")
+        creds = Credentials.from_authorized_user_file(
+            token_path,
+            scopes=[
+                "https://www.googleapis.com/auth/gmail.send",
+                "https://www.googleapis.com/auth/gmail.readonly",
+                "https://www.googleapis.com/auth/gmail.modify",
+                "https://www.googleapis.com/auth/calendar"
+            ]
         )
+        gmail_service = build("gmail", "v1", credentials=creds, static_discovery=False)
+        calendar_service = build("calendar", "v3", credentials=creds, static_discovery=False)
+        logger.info("Gmail and Calendar API services initialized successfully")
+        return gmail_service, calendar_service
+    except FileNotFoundError as e:
+        logger.error(f"Authentication error: {e}")
+        raise RuntimeError(f"Authentication failed: {e}")
+    except Exception as e:
+        logger.error(f"Failed to initialize services: {e}")
+        raise RuntimeError(f"Service initialization failed: {e}")
 
-# Handle favicon request to avoid 404 logs
-@app.get("/favicon.ico")
-async def favicon():
-    return {"message": "No favicon"}
+# Helper functions
+def extract_dates(text: str) -> List[str]:
+    date_patterns = [
+        r'\b(\d{1,2}(?:st|nd|rd|th)?\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)(?:\s+\d{4})?)\b',
+        r'\b((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?(?:\s+\d{4})?)\b',
+        r'\b(\d{1,2}/\d{1,2}/\d{2,4})\b',
+        r'\b(\d{4}-\d{2}-\d{2})\b'
+    ]
+    found_dates = []
+    for pattern in date_patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE)
+        found_dates.extend(matches)
+    return found_dates
 
-# Simple HTML form for generating emails (for browser testing)
-@app.get("/", response_class=HTMLResponse)
-async def get_root():
-    return """
-    <html>
-        <head>
-            <title>Email Assistant</title>
-            <style>
-                body { font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }
-                form { display: flex; flex-direction: column; }
-                label { margin-top: 10px; }
-                input, textarea { padding: 8px; margin-bottom: 10px; }
-                button { padding: 10px; background: #4285f4; color: white; border: none; cursor: pointer; }
-            </style>
-        </head>
-        <body>
-            <h1>Email Assistant</h1>
-            <form action="/generate-email-form" method="post">
-                <label for="to">To:</label>
-                <input type="email" id="to" name="to" required>
-                
-                <label for="subject">Subject:</label>
-                <input type="text" id="subject" name="subject" required>
-                
-                <button type="submit">Generate Email</button>
-            </form>
-            
-            <h2>Send Custom Email</h2>
-            <form action="/send-email-form" method="post">
-                <label for="to">To:</label>
-                <input type="email" id="to" name="to" required>
-                
-                <label for="subject">Subject:</label>
-                <input type="text" id="subject" name="subject" required>
-                
-                <label for="body">Body:</label>
-                <textarea id="body" name="body" rows="10" required></textarea>
-                
-                <button type="submit">Send Email</button>
-            </form>
-        </body>
-    </html>
-    """
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type((HttpError, TimeoutError)))
+def fetch_unread_messages(service) -> dict:
+    return service.users().messages().list(
+        userId="me",
+        q="is:unread",
+        maxResults=20,
+        fields="messages(id),nextPageToken"
+    ).execute()
 
-# Fetch previous emails
-def get_email_history(subject: str):
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=5), retry=retry_if_exception_type((HttpError, TimeoutError)))
+def get_message_details(service, message_id: str) -> dict:
+    return service.users().messages().get(
+        userId="me",
+        id=message_id,
+        format="metadata",
+        metadataHeaders=["From", "Subject", "Date"]
+    ).execute()
+
+@app.get("/unread-emails", response_model=dict)
+async def get_unread_emails():
     try:
-        logger.info(f"Fetching email history for subject: {subject}")
-        response = gmail_service.users().messages().list(userId="me", q=f"subject:{subject}", maxResults=10).execute()
+        gmail, _ = get_services()
+        logger.info("Fetching unread emails")
+        start_time = time.time()
+        response = fetch_unread_messages(gmail)
         messages = response.get("messages", [])
-        
         if not messages:
-            logger.info("No previous email history found")
-            return []
-
-        email_threads = []
+            logger.info("No unread emails found")
+            return {"emails": []}
+        unread_emails = []
         for msg in messages:
-            email_data = gmail_service.users().messages().get(userId="me", id=msg["id"]).execute()
-            snippet = email_data.get("snippet", "")
-            email_threads.append(snippet)
-
-        logger.info(f"Found {len(email_threads)} emails in history")
-        return email_threads
-    except Exception as e:
-        logger.error(f"Failed to fetch email history: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch email history: {e}")
-
-# API endpoint for fetching emails
-@app.get("/fetch-emails")
-def fetch_emails(subject: str = Query(...)):
-    try:
-        history = get_email_history(subject)
-        return {"emails": history}
-    except Exception as e:
-        logger.error(f"Error in fetch_emails: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# Generate AI-powered email - API endpoint (POST)
-@app.post("/generate-email")
-def generate_email(request: GenerateEmailRequest):
-    logger.info(f"Generating email for subject: {request.subject}")
-    
-    # Use provided email history or fetch it if empty
-    email_history = request.email_history
-    if not email_history:
-        logger.info("No email history provided, fetching from Gmail...")
-        email_history = get_email_history(request.subject)
-    
-    # Format history for prompt
-    history_text = "\n".join(email_history) if email_history else "No previous email history."
-    
-    # Alternative models if Mistral fails:
-    # - "meta-llama/Llama-2-7b-chat-hf"
-    # - "gpt-3.5-turbo" (if using OpenAI)
-    
-    api_url = "https://api.together.xyz/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {TOGETHER_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "mistralai/Mistral-7B-Instruct-v0.1",
-        "messages": [
-            {"role": "system", "content": "You are an AI email assistant."},
-            {"role": "user", "content": f"Based on this email history:\n{history_text}\nGenerate a professional email for subject: '{request.subject}'"}
-        ],
-        "max_tokens": 200
-    }
-    
-    try:
-        # Log request details for debugging
-        logger.info(f"Sending request to Together AI with subject: {request.subject}")
-        logger.info(f"Model being used: {payload['model']}")
-        
-        response = requests.post(api_url, json=payload, headers=headers)
-        
-        logger.info(f"Together AI response status: {response.status_code}")
-        
-        # Check for non-200 status
-        if response.status_code != 200:
-            logger.error(f"Together AI error: {response.text}")
-            # Try to return message from JSON if available
             try:
-                error_json = response.json()
-                error_message = error_json.get('error', {}).get('message', response.text)
-                raise HTTPException(status_code=response.status_code, detail=f"AI API error: {error_message}")
-            except json.JSONDecodeError:
-                # If not JSON, return text
-                raise HTTPException(status_code=response.status_code, detail=f"AI API error: {response.text}")
-        
-        # Try to parse response
-        try:
-            data = response.json()
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse API response as JSON: {response.text[:500]}")
-            raise HTTPException(status_code=500, detail="AI API returned invalid JSON")
-        
-        # Check for expected data structure
-        if "choices" in data and data["choices"] and len(data["choices"]) > 0:
-            if "message" in data["choices"][0] and "content" in data["choices"][0]["message"]:
-                generated_email = data["choices"][0]["message"]["content"].strip()
-                logger.info("Email generated successfully")
-                return {"email_content": generated_email}
-            else:
-                logger.error(f"Unexpected response structure: {data}")
-                raise HTTPException(status_code=500, detail="AI API response missing expected fields")
-        else:
-            logger.error(f"API response missing choices: {data}")
-            raise HTTPException(status_code=500, detail="API response missing choices")
-            
-    except requests.exceptions.RequestException as e:
-        logger.error(f"AI API request failed: {e}")
-        raise HTTPException(status_code=500, detail=f"AI API request failed: {str(e)}")
+                email_data = get_message_details(gmail, msg["id"])
+                headers = {header["name"].lower(): header["value"] for header in email_data.get("payload", {}).get("headers", [])}
+                email_info = {
+                    "id": msg["id"],
+                    "from": headers.get("from", "Unknown Sender"),
+                    "subject": headers.get("subject", "No Subject"),
+                    "date": headers.get("date", "Unknown Date"),
+                    "snippet": email_data.get("snippet", ""),
+                    "potentialDates": extract_dates(email_data.get("snippet", ""))
+                }
+                unread_emails.append(email_info)
+            except Exception as e:
+                logger.warning(f"Skipping message {msg['id']} due to error: {str(e)}")
+                continue
+        logger.info(f"Fetched {len(unread_emails)} unread emails in {time.time() - start_time:.2f}s")
+        return {"emails": unread_emails}
+    except HttpError as e:
+        logger.error(f"Gmail API error: {e}")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Gmail API service unavailable: {str(e)}")
     except Exception as e:
-        logger.error(f"Unexpected error in generate_email: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+        logger.error(f"Unexpected error fetching emails: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to fetch unread emails: {str(e)}")
 
-# Generate email - Form version (works with HTML form)
-@app.post("/generate-email-form", response_class=HTMLResponse)
-async def generate_email_form(to: str = Form(...), subject: str = Form(...)):
+@app.post("/mark-as-read", status_code=status.HTTP_200_OK)
+async def mark_email_as_read(request: MarkAsReadRequest):
     try:
-        # Reuse the email generation logic
-        request = GenerateEmailRequest(subject=subject)
-        result = generate_email(request)
-        
-        generated_email = result["email_content"]
-        
-        # Return HTML form with generated email
-        return f"""
-        <html>
-            <head>
-                <title>Generated Email</title>
-                <style>
-                    body {{ font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }}
-                    form {{ display: flex; flex-direction: column; }}
-                    label {{ margin-top: 10px; }}
-                    input, textarea {{ padding: 8px; margin-bottom: 10px; }}
-                    button {{ padding: 10px; background: #4285f4; color: white; border: none; cursor: pointer; }}
-                </style>
-            </head>
-            <body>
-                <h1>Generated Email</h1>
-                <form action="/send-email-form" method="post">
-                    <label for="to">To:</label>
-                    <input type="email" id="to" name="to" value="{to}" required>
-                    
-                    <label for="subject">Subject:</label>
-                    <input type="text" id="subject" name="subject" value="{subject}" required>
-                    
-                    <label for="body">Body:</label>
-                    <textarea id="body" name="body" rows="10" required>{generated_email}</textarea>
-                    
-                    <button type="submit">Send Email</button>
-                </form>
-                <p><a href="/">Back to form</a></p>
-            </body>
-        </html>
-        """
+        gmail, _ = get_services()
+        logger.info(f"Marking email {request.message_id} as read")
+        gmail.users().messages().modify(userId="me", id=request.message_id, body={"removeLabelIds": ["UNREAD"]}).execute()
+        return {"status": "Email marked as read"}
+    except HttpError as e:
+        logger.error(f"Failed to mark email as read: {e}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid message ID: {str(e)}")
     except Exception as e:
-        logger.error(f"Error in generate_email_form: {e}")
-        return f"""
-        <html>
-            <head><title>Error</title></head>
-            <body>
-                <h1>Error</h1>
-                <p>Failed to generate email: {str(e)}</p>
-                <p><a href="/">Back to form</a></p>
-            </body>
-        </html>
-        """
+        logger.error(f"Error marking email as read: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to mark email as read: {str(e)}")
 
-# Send email - API endpoint (POST)
-@app.post("/send-email")
-def send_email(request: EmailRequest):
-    logger.info(f"Sending email to: {request.to} with subject: {request.subject}")
-    
-    if not request.body:
-        logger.error("Email body is missing")
-        raise HTTPException(status_code=400, detail="Email body is required")
-    
+@app.post("/send-email", status_code=status.HTTP_200_OK)
+async def send_email(request: EmailRequest):
     try:
+        gmail, _ = get_services()
         message = MIMEText(request.body)
         message["to"] = request.to
         message["subject"] = request.subject
         raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
-        gmail_service.users().messages().send(userId="me", body={"raw": raw_message}).execute()
-        logger.info("Email sent successfully")
-        return {"status": "Email sent successfully!"}
-    except Exception as e:
+        gmail.users().messages().send(userId="me", body={"raw": raw_message}).execute()
+        return {"status": "Email sent successfully"}
+    except HttpError as e:
         logger.error(f"Failed to send email: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to send email: {e}")
-
-# Send email - Form version (works with HTML form)
-@app.post("/send-email-form", response_class=HTMLResponse)
-async def send_email_form(to: str = Form(...), subject: str = Form(...), body: str = Form(...)):
-    try:
-        request = EmailRequest(to=to, subject=subject, body=body)
-        result = send_email(request)
-        
-        return f"""
-        <html>
-            <head>
-                <title>Email Sent</title>
-                <style>
-                    body {{ font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; }}
-                </style>
-            </head>
-            <body>
-                <h1>Success!</h1>
-                <p>{result['status']}</p>
-                <p>Email was sent to: {to}</p>
-                <p>Subject: {subject}</p>
-                <p><a href="/">Back to form</a></p>
-            </body>
-        </html>
-        """
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid email parameters: {str(e)}")
     except Exception as e:
-        logger.error(f"Error in send_email_form: {e}")
-        return f"""
-        <html>
-            <head><title>Error</title></head>
-            <body>
-                <h1>Error</h1>
-                <p>Failed to send email: {str(e)}</p>
-                <p><a href="/">Back to form</a></p>
-            </body>
-        </html>
-        """
+        logger.error(f"Error sending email: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to send email: {str(e)}")
 
-# Debug endpoint - Check configuration
-@app.get("/debug/config")
-def debug_config():
-    return {
-        "api_key_set": bool(TOGETHER_API_KEY),
-        "gmail_authenticated": bool(gmail_service),
-        "models_available": ["mistralai/Mistral-7B-Instruct-v0.1", "meta-llama/Llama-2-7b-chat-hf"]
-    }
-
-# Testing endpoint - Test AI without Gmail
-@app.post("/debug/test-ai")
-def test_ai(message: str = "Generate a short test email"):
-    api_url = "https://api.together.xyz/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {TOGETHER_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "meta-llama/Llama-2-7b-chat-hf",  # Alternative model as a fallback
-        "messages": [
-            {"role": "system", "content": "You are an AI assistant."},
-            {"role": "user", "content": message}
-        ],
-        "max_tokens": 100
-    }
-    
+@app.get("/fetch-emails", response_model=dict)
+async def fetch_emails_by_subject(subject: str):
     try:
-        response = requests.post(api_url, json=payload, headers=headers)
-        response.raise_for_status()
-        return response.json()
+        gmail, _ = get_services()
+        query = f"subject:{subject}"
+        response = gmail.users().messages().list(userId="me", q=query, maxResults=10).execute()
+        messages = response.get("messages", [])
+        if not messages:
+            return {"emails": []}
+        email_history = []
+        for msg in messages:
+            try:
+                email_data = gmail.users().messages().get(userId="me", id=msg["id"], format="full").execute()
+                headers = {header["name"].lower(): header["value"] for header in email_data.get("payload", {}).get("headers", [])}
+                parts = email_data.get("payload", {}).get("parts", [])
+                body = ""
+                if parts:
+                    for part in parts:
+                        if part.get("mimeType") == "text/plain":
+                            body_data = part.get("body", {}).get("data", "")
+                            if body_data:
+                                body += base64.urlsafe_b64decode(body_data).decode("utf-8")
+                else:
+                    body_data = email_data.get("payload", {}).get("body", {}).get("data", "")
+                    if body_data:
+                        body = base64.urlsafe_b64decode(body_data).decode("utf-8")
+                email_entry = f"From: {headers.get('from', 'Unknown')}\nTo: {headers.get('to', 'Unknown')}\nDate: {headers.get('date', 'Unknown')}\nSubject: {headers.get('subject', 'No Subject')}\n\n{body}"
+                email_history.append(email_entry)
+            except Exception as e:
+                logger.warning(f"Error processing message {msg['id']}: {str(e)}")
+                continue
+        return {"emails": email_history}
+    except HttpError as e:
+        logger.error(f"Gmail API error: {e}")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Gmail API service unavailable: {str(e)}")
     except Exception as e:
-        logger.error(f"Test AI failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Test failed: {str(e)}")
+        logger.error(f"Unexpected error fetching emails: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to fetch emails: {str(e)}")
+
+@app.post("/generate-email", status_code=status.HTTP_200_OK)
+async def generate_email(request: GenerateEmailRequest):
+    try:
+        subject = request.subject
+        history = request.email_history or []
+
+        prompt = f"You are an email assistant. Write a professional email reply based on the following subject and history.\n\n"
+        prompt += f"Subject: {subject}\n\n"
+        if history:
+            for i, email in enumerate(history[:3]):
+                prompt += f"Email {i+1}:\n{email[:500]}\n\n"
+        prompt += "Compose the reply email below:\n\n"
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.together.xyz/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {TOGETHER_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
+                    "messages": [
+                        {"role": "system", "content": "You are a helpful email assistant."},
+                        {"role": "user", "content": prompt}
+                    ],
+                    "temperature": 0.7,
+                    "max_tokens": 512
+                }
+            )
+            response.raise_for_status()
+            data = response.json()
+            generated_content = data['choices'][0]['message']['content']
+            return {"email_content": generated_content}
+    except httpx.HTTPStatusError as e:
+        logger.error(f"Together API returned error: {e.response.text}")
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Failed to get response from AI model.")
+    except Exception as e:
+        logger.error(f"Error generating email: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to generate email content: {str(e)}")
+
+@app.post("/create-event", status_code=status.HTTP_201_CREATED)
+async def create_calendar_event(request: CreateEventRequest):
+    try:
+        _, calendar = get_services()
+        attendees = [{'email': email} for email in request.attendees if email] if request.attendees else []
+        event = {
+            'summary': request.summary,
+            'description': request.description or "",
+            'start': {'dateTime': request.start_datetime, 'timeZone': 'UTC'},
+            'end': {'dateTime': request.end_datetime, 'timeZone': 'UTC'},
+            'attendees': attendees
+        }
+        created_event = calendar.events().insert(calendarId='primary', body=event, sendUpdates='all').execute()
+        return {
+            "status": "Event created",
+            "eventId": created_event.get('id'),
+            "htmlLink": created_event.get('htmlLink')
+        }
+    except HttpError as e:
+        logger.error(f"Failed to create event: {e}")
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid event parameters: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error creating event: {e}")
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to create event: {str(e)}")
+
+@app.get("/health")
+async def health_check():
+    try:
+        gmail, calendar = get_services()
+        gmail.users().getProfile(userId="me").execute()
+        calendar.calendarList().list().execute()
+        return {"status": "healthy", "message": "Services are running normally"}
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Service unavailable: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

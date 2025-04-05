@@ -1,296 +1,226 @@
-import { useState } from "react";
-import axios from "axios";
+// ... imports stay the same
+import React, { useState, useEffect } from 'react';
+import axios from 'axios';
+import {
+  Box, Card, CardContent, Typography, List, ListItem, ListItemText,
+  Button, CircularProgress, Alert, TextField, Dialog, DialogTitle,
+  DialogContent, DialogActions, Snackbar
+} from '@mui/material';
+
+const API_BASE_URL = 'http://localhost:8000';
 
 const EmailBot = () => {
-  const [recipient, setRecipient] = useState("");
-  const [subject, setSubject] = useState("");
-  const [emailBody, setEmailBody] = useState("");
-  const [emailHistory, setEmailHistory] = useState([]);
+  const [emails, setEmails] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [generating, setGenerating] = useState(false);
-  const [sending, setSending] = useState(false);
-  const [showHistory, setShowHistory] = useState(false);
-  const [errorMsg, setErrorMsg] = useState("");
-  const [successMsg, setSuccessMsg] = useState("");
+  const [error, setError] = useState(null);
+  const [selectedEmail, setSelectedEmail] = useState(null);
+  const [composeOpen, setComposeOpen] = useState(false);
+  const [newEmail, setNewEmail] = useState({ to: '', subject: '', body: '' });
+  const [snackbar, setSnackbar] = useState({ open: false, message: '', severity: 'success' });
+  const [loadingAI, setLoadingAI] = useState(false);
 
-  // Base URL for API
-  const API_BASE_URL = "http://localhost:8000";
+  useEffect(() => {
+    fetchUnreadEmails();
+  }, []);
 
-  // Clear messages after delay
-  const clearMessages = () => {
-    setTimeout(() => {
-      setErrorMsg("");
-      setSuccessMsg("");
-    }, 5000);
-  };
-
-  // Display status message
-  const showMessage = (isError, message) => {
-    if (isError) {
-      setErrorMsg(message);
-      setSuccessMsg("");
-    } else {
-      setSuccessMsg(message);
-      setErrorMsg("");
-    }
-    clearMessages();
-  };
-
-  // Fetch Previous Emails
-  const fetchEmails = async () => {
-    if (!subject) {
-      showMessage(true, "Please enter a subject to fetch email history.");
-      return;
-    }
-    
+  const fetchUnreadEmails = async () => {
     setLoading(true);
-    setErrorMsg("");
-    
+    setError(null);
     try {
-      console.log(`Fetching emails for subject: ${subject}`);
-      const response = await axios.get(`${API_BASE_URL}/fetch-emails`, {
-        params: { subject: subject }
-      });
-      
-      console.log("Fetch response:", response.data);
-      
-      const emails = response.data.emails || [];
-      setEmailHistory(emails);
-      
-      if (emails.length > 0) {
-        setShowHistory(true);
-        showMessage(false, `Found ${emails.length} related emails`);
-      } else {
-        showMessage(true, "No email history found for this subject.");
-      }
-    } catch (error) {
-      console.error("Error fetching emails:", error);
-      
-      // Log detailed error information
-      if (error.response) {
-        console.error("Response data:", error.response.data);
-        console.error("Response status:", error.response.status);
-      }
-      
-      showMessage(true, `Failed to fetch emails: ${error.response?.data?.detail || error.message}`);
+      const response = await axios.get(`${API_BASE_URL}/unread-emails`, { timeout: 40000 });
+      setEmails(response.data.emails || []);
+    } catch (err) {
+      const errorMessage = err.response?.data?.detail || err.message || 'Failed to fetch emails';
+      setError(`Unable to fetch emails: ${errorMessage}`);
     } finally {
       setLoading(false);
     }
   };
 
-  // Generate AI Email
-  const generateEmail = async () => {
-    if (!subject) {
-      showMessage(true, "Please enter a subject first.");
-      return;
-    }
-    
-    setGenerating(true);
-    setErrorMsg("");
-    
+  const markAsRead = async (messageId) => {
     try {
-      // Log the request payload
-      const payload = {
-        subject,
-        email_history: emailHistory
-      };
-      console.log("Generating email with payload:", payload);
-      
-      const response = await axios.post(`${API_BASE_URL}/generate-email`, payload);
-      
-      console.log("Generation response:", response.data);
-      
-      if (response.data.email_content) {
-        setEmailBody(response.data.email_content);
-        showMessage(false, "Email generated successfully!");
-      } else {
-        showMessage(true, "Generated email was empty. Please try again.");
-      }
-    } catch (error) {
-      console.error("Error generating email:", error);
-      
-      // Log detailed error information
-      if (error.response) {
-        console.error("Response data:", error.response.data);
-        console.error("Response status:", error.response.status);
-      } else if (error.request) {
-        console.error("No response received:", error.request);
-      } else {
-        console.error("Error setting up request:", error.message);
-      }
-      
-      showMessage(true, `Failed to generate email: ${error.response?.data?.detail || error.message}`);
-    } finally {
-      setGenerating(false);
+      await axios.post(`${API_BASE_URL}/mark-as-read`, { message_id: messageId });
+      setEmails(emails.filter(email => email.id !== messageId));
+      showSnackbar('Email marked as read', 'success');
+    } catch {
+      showSnackbar('Failed to mark email as read', 'error');
     }
   };
 
-  // Send Email
   const sendEmail = async () => {
-    if (!recipient || !subject || !emailBody) {
-      showMessage(true, "Please fill in all fields before sending.");
-      return;
-    }
-    
-    setSending(true);
-    setErrorMsg("");
-    
     try {
-      // Log the request payload
-      const payload = {
-        to: recipient,
-        subject,
-        body: emailBody
-      };
-      console.log("Sending email with payload:", payload);
-      
-      const response = await axios.post(`${API_BASE_URL}/send-email`, payload);
-      
-      console.log("Send response:", response.data);
-      
-      showMessage(false, "✅ Email sent successfully!");
-      // Clear form after successful send
-      setEmailBody("");
-    } catch (error) {
-      console.error("Error sending email:", error);
-      
-      // Log detailed error information
-      if (error.response) {
-        console.error("Response data:", error.response.data);
-        console.error("Response status:", error.response.status);
-      }
-      
-      showMessage(true, `Failed to send email: ${error.response?.data?.detail || error.message}`);
-    } finally {
-      setSending(false);
+      await axios.post(`${API_BASE_URL}/send-email`, newEmail);
+      setComposeOpen(false);
+      resetComposeForm();
+      showSnackbar('Email sent successfully', 'success');
+    } catch {
+      showSnackbar('Failed to send email', 'error');
     }
   };
 
-  // Test backend connection
-  const testConnection = async () => {
-    try {
-      setLoading(true);
-      const response = await axios.get(`${API_BASE_URL}/debug/config`);
-      console.log("API configuration:", response.data);
-      showMessage(false, "Connected to backend successfully");
-    } catch (error) {
-      console.error("Connection test failed:", error);
-      showMessage(true, `Backend connection failed: ${error.message}`);
-    } finally {
-      setLoading(false);
+  const createEventFromEmail = async (email) => {
+    if (!email.potentialDates?.length) {
+      showSnackbar('No dates found in this email', 'warning');
+      return;
     }
+
+    try {
+      const dateString = email.potentialDates[0];
+      const eventDate = new Date(dateString);
+      if (isNaN(eventDate.getTime())) {
+        showSnackbar('Invalid date format', 'error');
+        return;
+      }
+
+      const endDate = new Date(eventDate);
+      endDate.setHours(endDate.getHours() + 1);
+
+      await axios.post(`${API_BASE_URL}/create-event`, {
+        summary: `Meeting regarding: ${email.subject}`,
+        description: `From email from ${email.from}\n\n${email.snippet}`,
+        start_datetime: eventDate.toISOString(),
+        end_datetime: endDate.toISOString(),
+        attendees: [email.from.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/)?.[0]]
+      });
+
+      showSnackbar('Calendar event created', 'success');
+    } catch {
+      showSnackbar('Failed to create calendar event', 'error');
+    }
+  };
+
+  const generateWithAI = async () => {
+    if (!newEmail.subject) {
+      showSnackbar('Please enter a subject to generate the email', 'warning');
+      return;
+    }
+
+    try {
+      setLoadingAI(true);
+      const response = await axios.post(`${API_BASE_URL}/generate-email`, {
+        subject: newEmail.subject
+      });
+      const generated = response.data.email_content || 'Generated content not available.';
+
+      setNewEmail(prev => ({ ...prev, body: generated }));
+      showSnackbar('Email body generated!', 'success');
+    } catch (err) {
+      console.error('AI generation failed:', err);
+      showSnackbar('Failed to generate email body', 'error');
+    } finally {
+      setLoadingAI(false);
+    }
+  };
+
+  const showSnackbar = (message, severity = 'info') => {
+    setSnackbar({ open: true, message, severity });
+  };
+
+  const handleCloseSnackbar = () => {
+    setSnackbar({ ...snackbar, open: false });
+  };
+
+  const resetComposeForm = () => {
+    setNewEmail({ to: '', subject: '', body: '' });
+  };
+
+  const handleComposeChange = (e) => {
+    const { name, value } = e.target;
+    setNewEmail(prev => ({ ...prev, [name]: value }));
   };
 
   return (
-    <div className="max-w-2xl mx-auto p-6 bg-gray-100 shadow-lg rounded-lg mt-10 border border-gray-300">
-      <h2 className="text-2xl font-bold text-center text-gray-800 mb-4">📧 AI Email Assistant</h2>
-      
-      {/* Status Messages */}
-      {errorMsg && (
-        <div className="bg-red-100 border-l-4 border-red-500 text-red-700 p-4 mb-4 rounded">
-          <p>{errorMsg}</p>
-        </div>
-      )}
-      
-      {successMsg && (
-        <div className="bg-green-100 border-l-4 border-green-500 text-green-700 p-4 mb-4 rounded">
-          <p>{successMsg}</p>
-        </div>
-      )}
-      
-      <input
-        type="email"
-        placeholder="Recipient Email"
-        value={recipient}
-        onChange={(e) => setRecipient(e.target.value)}
-        className="w-full p-3 border border-gray-400 bg-white rounded-md mb-3 text-gray-900 placeholder-gray-600 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-      />
-      
-      <input
-        type="text"
-        placeholder="Email Subject"
-        value={subject}
-        onChange={(e) => setSubject(e.target.value)}
-        className="w-full p-3 border border-gray-400 bg-white rounded-md mb-3 text-gray-900 placeholder-gray-600 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-      />
-      
-      <div className="flex flex-col space-y-3 mb-4">
-        <div className="flex space-x-2">
-          <button 
-            onClick={fetchEmails} 
-            disabled={loading}
-            className="flex-1 bg-blue-600 text-white p-3 rounded hover:bg-blue-700 transition disabled:bg-blue-400 disabled:cursor-not-allowed"
-          >
-            {loading ? "Fetching..." : "🔍 Fetch Email History"}
-          </button>
-          
-          <button
-            onClick={testConnection}
-            disabled={loading}
-            className="bg-gray-600 text-white px-3 rounded hover:bg-gray-700 transition disabled:bg-gray-400 disabled:cursor-not-allowed"
-            title="Test backend connection"
-          >
-            🔄
-          </button>
-        </div>
-        
-        <button 
-          onClick={generateEmail} 
-          disabled={generating}
-          className="w-full bg-green-600 text-white p-3 rounded hover:bg-green-700 transition disabled:bg-green-400 disabled:cursor-not-allowed"
-        >
-          {generating ? "Generating..." : "🤖 Generate Email"}
-        </button>
-      </div>
-      
-      {/* Email History Section */}
-      {showHistory && (
-        <div className="mb-4 border border-gray-300 rounded-md p-3 bg-white">
-          <div className="flex justify-between items-center mb-2">
-            <h3 className="font-bold">Email History ({emailHistory.length})</h3>
-            <button 
-              onClick={() => setShowHistory(false)} 
-              className="text-sm text-gray-600 hover:text-gray-900"
-            >
-              Hide
-            </button>
-          </div>
-          
-          {emailHistory.length > 0 ? (
-            <div className="max-h-40 overflow-y-auto text-sm text-gray-700">
-              {emailHistory.map((snippet, index) => (
-                <div key={index} className="mb-2 p-2 border-b border-gray-200">
-                  {snippet}
-                </div>
-              ))}
-            </div>
+    <Box sx={{ p: 3, maxWidth: 800, mx: 'auto' }}>
+      <Typography variant="h4" gutterBottom>Email Assistant</Typography>
+
+      <Box sx={{ mb: 3, display: 'flex', justifyContent: 'space-between' }}>
+        <Button variant="contained" onClick={fetchUnreadEmails} disabled={loading}>Refresh Emails</Button>
+        <Button variant="outlined" onClick={() => setComposeOpen(true)}>Compose Email</Button>
+      </Box>
+
+      {error && <Alert severity="error" sx={{ mb: 2 }}>{error}</Alert>}
+
+      <Card>
+        <CardContent>
+          <Typography variant="h6" gutterBottom>Unread Emails</Typography>
+          {loading ? (
+            <Box sx={{ display: 'flex', justifyContent: 'center', p: 3 }}><CircularProgress /></Box>
+          ) : emails.length === 0 ? (
+            <Typography variant="body1" color="textSecondary" align="center">No unread emails found</Typography>
           ) : (
-            <p className="text-sm text-gray-500">No email history found</p>
+            <List>
+              {emails.map((email) => (
+                <ListItem key={email.id} divider sx={{ cursor: 'pointer', '&:hover': { bgcolor: 'rgba(0, 0, 0, 0.04)' } }} onClick={() => setSelectedEmail(email)}>
+                  <ListItemText
+                    primary={<Typography variant="subtitle1" noWrap>{email.subject}</Typography>}
+                    secondary={
+                      <>
+                        <Typography variant="body2" color="textSecondary">From: {email.from}</Typography>
+                        <Typography variant="body2" color="textSecondary">{new Date(email.date).toLocaleString()}</Typography>
+                        <Typography variant="body2" noWrap>{email.snippet}</Typography>
+                      </>
+                    }
+                  />
+                </ListItem>
+              ))}
+            </List>
           )}
-        </div>
-      )}
-      
-      {/* Email Body Textarea */}
-      <textarea
-        placeholder="Email Body (generated or write your own)"
-        value={emailBody}
-        onChange={(e) => setEmailBody(e.target.value)}
-        rows={8}
-        className="w-full p-3 border border-gray-400 bg-white rounded-md mb-3 text-gray-900 placeholder-gray-600 focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
-      />
-      
-      <button 
-        onClick={sendEmail} 
-        disabled={sending}
-        className="w-full bg-purple-600 text-white p-3 rounded hover:bg-purple-700 transition disabled:bg-purple-400 disabled:cursor-not-allowed"
-      >
-        {sending ? "Sending..." : "📤 Send Email"}
-      </button>
-      
-      <div className="mt-4 text-xs text-gray-500 text-center">
-        <p>Version 1.0.2 • Connected to API at {API_BASE_URL}</p>
-      </div>
-    </div>
+        </CardContent>
+      </Card>
+
+      {/* View Email Dialog */}
+      <Dialog open={Boolean(selectedEmail)} onClose={() => setSelectedEmail(null)} maxWidth="md" fullWidth>
+        {selectedEmail && (
+          <>
+            <DialogTitle>{selectedEmail.subject}</DialogTitle>
+            <DialogContent>
+              <Typography variant="body2" color="textSecondary"><strong>From:</strong> {selectedEmail.from}</Typography>
+              <Typography variant="body2" color="textSecondary"><strong>Date:</strong> {new Date(selectedEmail.date).toLocaleString()}</Typography>
+              <Typography variant="body1" paragraph>{selectedEmail.snippet}</Typography>
+
+              {selectedEmail.potentialDates?.length > 0 && (
+                <Box sx={{ mt: 2, p: 2, bgcolor: 'rgba(0, 0, 0, 0.04)', borderRadius: 1 }}>
+                  <Typography variant="subtitle2">Potential dates mentioned:</Typography>
+                  <List dense>
+                    {selectedEmail.potentialDates.map((date, index) => (
+                      <ListItem key={index}><ListItemText primary={date} /></ListItem>
+                    ))}
+                  </List>
+                </Box>
+              )}
+            </DialogContent>
+            <DialogActions>
+              <Button onClick={() => createEventFromEmail(selectedEmail)}>Create Calendar Event</Button>
+              <Button onClick={() => markAsRead(selectedEmail.id)}>Mark as Read</Button>
+              <Button onClick={() => setSelectedEmail(null)}>Close</Button>
+            </DialogActions>
+          </>
+        )}
+      </Dialog>
+
+      {/* Compose Email Dialog */}
+      <Dialog open={composeOpen} onClose={() => setComposeOpen(false)} maxWidth="md" fullWidth>
+        <DialogTitle>Compose Email</DialogTitle>
+        <DialogContent>
+          <TextField margin="dense" label="To" type="email" fullWidth name="to" value={newEmail.to} onChange={handleComposeChange} sx={{ mb: 2 }} />
+          <TextField margin="dense" label="Subject" fullWidth name="subject" value={newEmail.subject} onChange={handleComposeChange} sx={{ mb: 2 }} />
+          <TextField margin="dense" label="Body" multiline rows={8} fullWidth name="body" value={newEmail.body} onChange={handleComposeChange} />
+        </DialogContent>
+        <DialogActions>
+          <Button onClick={() => setComposeOpen(false)}>Cancel</Button>
+          <Button onClick={generateWithAI} disabled={loadingAI}>
+            {loadingAI ? 'Generating...' : 'Generate with AI'}
+          </Button>
+          <Button onClick={sendEmail} color="primary" variant="contained">Send</Button>
+        </DialogActions>
+      </Dialog>
+
+      <Snackbar open={snackbar.open} autoHideDuration={6000} onClose={handleCloseSnackbar}>
+        <Alert onClose={handleCloseSnackbar} severity={snackbar.severity} sx={{ width: '100%' }}>
+          {snackbar.message}
+        </Alert>
+      </Snackbar>
+    </Box>
   );
 };
 
