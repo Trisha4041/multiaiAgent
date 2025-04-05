@@ -1,12 +1,12 @@
-import React from 'react'
-import CalenderBot from "./componentsC/CalenderBot";
+import React from 'react';
+import CalendarManager from './CalendarManager';
 
-const App = () => {
+function App() {
   return (
-    <div>
-      <CalenderBot/>
+    <div className="min-h-screen bg-white">
+      <CalendarManager />
     </div>
-  )
+  );
 }
 
-export default App
+export default App;

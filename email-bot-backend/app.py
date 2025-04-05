@@ -119,7 +119,7 @@ def fetch_unread_messages(service) -> dict:
     return service.users().messages().list(
         userId="me",
         q="is:unread",
-        maxResults=20,
+        maxResults=5,
         fields="messages(id),nextPageToken"
     ).execute()
 

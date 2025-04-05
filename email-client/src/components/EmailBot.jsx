@@ -27,7 +27,7 @@ const EmailBot = () => {
     setLoading(true);
     setError(null);
     try {
-      const response = await axios.get(`${API_BASE_URL}/unread-emails`, { timeout: 40000 });
+      const response = await axios.get(`${API_BASE_URL}/unread-emails`, { timeout: 60000 });
       setEmails(response.data.emails || []);
     } catch (err) {
       const errorMessage = err.response?.data?.detail || err.message || 'Failed to fetch emails';
