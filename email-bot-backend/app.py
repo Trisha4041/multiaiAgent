@@ -9,7 +9,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from email.mime.text import MIMEText
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, status, Depends
+from fastapi import FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -17,8 +17,10 @@ from typing import Optional, List, Tuple
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 import httpx
 import time
-
-# Configure logging and silence discovery_cache warnings
+import re
+import dateparser
+from dateparser.search import search_dates
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
@@ -37,7 +39,7 @@ app = FastAPI(
     description="API for managing emails and calendar events"
 )
 
-# Add CORS middleware
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -66,11 +68,13 @@ class CreateEventRequest(BaseModel):
     end_datetime: str
     attendees: Optional[List[str]] = None
 
-# Global variables for services
+class ExtractDateRequest(BaseModel):
+    snippet: str
+
+# Services
 gmail_service = None
 calendar_service = None
 
-# Initialize Gmail and Calendar services
 def get_services() -> Tuple:
     global gmail_service, calendar_service
     if gmail_service and calendar_service:
@@ -93,97 +97,99 @@ def get_services() -> Tuple:
         calendar_service = build("calendar", "v3", credentials=creds, static_discovery=False)
         logger.info("Gmail and Calendar API services initialized successfully")
         return gmail_service, calendar_service
-    except FileNotFoundError as e:
-        logger.error(f"Authentication error: {e}")
-        raise RuntimeError(f"Authentication failed: {e}")
     except Exception as e:
         logger.error(f"Failed to initialize services: {e}")
         raise RuntimeError(f"Service initialization failed: {e}")
 
-# Helper functions
+# Improved date extractor
+
 def extract_dates(text: str) -> List[str]:
-    date_patterns = [
-        r'\b(\d{1,2}(?:st|nd|rd|th)?\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)(?:\s+\d{4})?)\b',
-        r'\b((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?(?:\s+\d{4})?)\b',
-        r'\b(\d{1,2}/\d{1,2}/\d{2,4})\b',
-        r'\b(\d{4}-\d{2}-\d{2})\b'
-    ]
-    found_dates = []
-    for pattern in date_patterns:
-        matches = re.findall(pattern, text, re.IGNORECASE)
-        found_dates.extend(matches)
-    return found_dates
+    combined_text = ' '.join(text.splitlines())
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=10), retry=retry_if_exception_type((HttpError, TimeoutError)))
+    # Match date like: April 10th, 2025
+    date_pattern = r'((?:\d{1,2}(?:st|nd|rd|th)?\s+)?(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s*\d{4})?)'
+
+    # Match time like: 3:00 PM or 3 PM
+    time_pattern = r'(\d{1,2}(?::\d{2})?\s*(?:AM|PM|am|pm))'
+
+    date_match = re.search(date_pattern, combined_text, re.IGNORECASE)
+    time_match = re.search(time_pattern, combined_text, re.IGNORECASE)
+
+    if date_match:
+        date_str = date_match.group()
+        parsed_date = dateparser.parse(date_str, settings={'PREFER_DATES_FROM': 'future'})
+        if not parsed_date:
+            return []
+
+        if time_match:
+            time_str = time_match.group()
+            parsed_time = dateparser.parse(time_str)
+            if parsed_time:
+                combined = parsed_date.replace(hour=parsed_time.hour, minute=parsed_time.minute)
+                return [combined.isoformat()]
+        
+        # Only date
+        return [parsed_date.isoformat()]
+    
+    return []
+
+
+@app.post("/extract-dates")
+def extract_dates_from_email(request: ExtractDateRequest):
+    if not request.snippet:
+        raise HTTPException(status_code=400, detail="Missing email snippet.")
+    extracted_dates = extract_dates(request.snippet)
+    return {"dates": extracted_dates}
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=4, max=10), retry=retry_if_exception_type((HttpError, TimeoutError)))
 def fetch_unread_messages(service) -> dict:
-    return service.users().messages().list(
-        userId="me",
-        q="is:unread",
-        maxResults=5,
-        fields="messages(id),nextPageToken"
-    ).execute()
+    return service.users().messages().list(userId="me", q="is:unread", maxResults=5, fields="messages(id),nextPageToken").execute()
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=5), retry=retry_if_exception_type((HttpError, TimeoutError)))
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(min=2, max=5), retry=retry_if_exception_type((HttpError, TimeoutError)))
 def get_message_details(service, message_id: str) -> dict:
-    return service.users().messages().get(
-        userId="me",
-        id=message_id,
-        format="metadata",
-        metadataHeaders=["From", "Subject", "Date"]
-    ).execute()
+    return service.users().messages().get(userId="me", id=message_id, format="metadata", metadataHeaders=["From", "Subject", "Date"]).execute()
 
 @app.get("/unread-emails", response_model=dict)
 async def get_unread_emails():
     try:
         gmail, _ = get_services()
-        logger.info("Fetching unread emails")
-        start_time = time.time()
         response = fetch_unread_messages(gmail)
         messages = response.get("messages", [])
         if not messages:
-            logger.info("No unread emails found")
             return {"emails": []}
         unread_emails = []
         for msg in messages:
             try:
                 email_data = get_message_details(gmail, msg["id"])
                 headers = {header["name"].lower(): header["value"] for header in email_data.get("payload", {}).get("headers", [])}
+                snippet = email_data.get("snippet", "")
                 email_info = {
                     "id": msg["id"],
                     "from": headers.get("from", "Unknown Sender"),
                     "subject": headers.get("subject", "No Subject"),
                     "date": headers.get("date", "Unknown Date"),
-                    "snippet": email_data.get("snippet", ""),
-                    "potentialDates": extract_dates(email_data.get("snippet", ""))
+                    "snippet": snippet,
+                    "potentialDates": extract_dates(snippet)
                 }
                 unread_emails.append(email_info)
             except Exception as e:
                 logger.warning(f"Skipping message {msg['id']} due to error: {str(e)}")
-                continue
-        logger.info(f"Fetched {len(unread_emails)} unread emails in {time.time() - start_time:.2f}s")
         return {"emails": unread_emails}
-    except HttpError as e:
-        logger.error(f"Gmail API error: {e}")
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Gmail API service unavailable: {str(e)}")
     except Exception as e:
-        logger.error(f"Unexpected error fetching emails: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to fetch unread emails: {str(e)}")
+        logger.error(f"Error fetching unread emails: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/mark-as-read", status_code=status.HTTP_200_OK)
+@app.post("/mark-as-read")
 async def mark_email_as_read(request: MarkAsReadRequest):
     try:
         gmail, _ = get_services()
-        logger.info(f"Marking email {request.message_id} as read")
         gmail.users().messages().modify(userId="me", id=request.message_id, body={"removeLabelIds": ["UNREAD"]}).execute()
         return {"status": "Email marked as read"}
-    except HttpError as e:
-        logger.error(f"Failed to mark email as read: {e}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid message ID: {str(e)}")
     except Exception as e:
         logger.error(f"Error marking email as read: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to mark email as read: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/send-email", status_code=status.HTTP_200_OK)
+@app.post("/send-email")
 async def send_email(request: EmailRequest):
     try:
         gmail, _ = get_services()
@@ -193,117 +199,51 @@ async def send_email(request: EmailRequest):
         raw_message = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
         gmail.users().messages().send(userId="me", body={"raw": raw_message}).execute()
         return {"status": "Email sent successfully"}
-    except HttpError as e:
-        logger.error(f"Failed to send email: {e}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid email parameters: {str(e)}")
     except Exception as e:
         logger.error(f"Error sending email: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to send email: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/fetch-emails", response_model=dict)
-async def fetch_emails_by_subject(subject: str):
-    try:
-        gmail, _ = get_services()
-        query = f"subject:{subject}"
-        response = gmail.users().messages().list(userId="me", q=query, maxResults=10).execute()
-        messages = response.get("messages", [])
-        if not messages:
-            return {"emails": []}
-        email_history = []
-        for msg in messages:
-            try:
-                email_data = gmail.users().messages().get(userId="me", id=msg["id"], format="full").execute()
-                headers = {header["name"].lower(): header["value"] for header in email_data.get("payload", {}).get("headers", [])}
-                parts = email_data.get("payload", {}).get("parts", [])
-                body = ""
-                if parts:
-                    for part in parts:
-                        if part.get("mimeType") == "text/plain":
-                            body_data = part.get("body", {}).get("data", "")
-                            if body_data:
-                                body += base64.urlsafe_b64decode(body_data).decode("utf-8")
-                else:
-                    body_data = email_data.get("payload", {}).get("body", {}).get("data", "")
-                    if body_data:
-                        body = base64.urlsafe_b64decode(body_data).decode("utf-8")
-                email_entry = f"From: {headers.get('from', 'Unknown')}\nTo: {headers.get('to', 'Unknown')}\nDate: {headers.get('date', 'Unknown')}\nSubject: {headers.get('subject', 'No Subject')}\n\n{body}"
-                email_history.append(email_entry)
-            except Exception as e:
-                logger.warning(f"Error processing message {msg['id']}: {str(e)}")
-                continue
-        return {"emails": email_history}
-    except HttpError as e:
-        logger.error(f"Gmail API error: {e}")
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=f"Gmail API service unavailable: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error fetching emails: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to fetch emails: {str(e)}")
-
-@app.post("/generate-email", status_code=status.HTTP_200_OK)
-async def generate_email(request: GenerateEmailRequest):
-    try:
-        subject = request.subject
-        history = request.email_history or []
-
-        prompt = f"You are an email assistant. Write a professional email reply based on the following subject and history.\n\n"
-        prompt += f"Subject: {subject}\n\n"
-        if history:
-            for i, email in enumerate(history[:3]):
-                prompt += f"Email {i+1}:\n{email[:500]}\n\n"
-        prompt += "Compose the reply email below:\n\n"
-
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.together.xyz/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {TOGETHER_API_KEY}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": "mistralai/Mixtral-8x7B-Instruct-v0.1",
-                    "messages": [
-                        {"role": "system", "content": "You are a helpful email assistant."},
-                        {"role": "user", "content": prompt}
-                    ],
-                    "temperature": 0.7,
-                    "max_tokens": 512
-                }
-            )
-            response.raise_for_status()
-            data = response.json()
-            generated_content = data['choices'][0]['message']['content']
-            return {"email_content": generated_content}
-    except httpx.HTTPStatusError as e:
-        logger.error(f"Together API returned error: {e.response.text}")
-        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Failed to get response from AI model.")
-    except Exception as e:
-        logger.error(f"Error generating email: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to generate email content: {str(e)}")
-
-@app.post("/create-event", status_code=status.HTTP_201_CREATED)
-async def create_calendar_event(request: CreateEventRequest):
+@app.post("/create-event")
+async def create_event(request: CreateEventRequest):
     try:
         _, calendar = get_services()
-        attendees = [{'email': email} for email in request.attendees if email] if request.attendees else []
+        
+        # Log the incoming date/time values
+        logger.info(f"Received start_datetime: {request.start_datetime}")
+        logger.info(f"Received end_datetime: {request.end_datetime}")
+        
+        # Force explicit times - hardcoded approach
+        # Extract just the date part from the incoming datetime
+        date_part = request.start_datetime.split('T')[0]
+        
+        # Create explicit ISO8601 formatted times at 15:00 and 16:00
+        start_iso = f"{date_part}T15:00:00"
+
+        end_iso = f"{date_part}T16:00:00+05:30"
+        
+        logger.info(f"Using fixed start time: {start_iso}")
+        logger.info(f"Using fixed end time: {end_iso}")
+        
         event = {
-            'summary': request.summary,
-            'description': request.description or "",
-            'start': {'dateTime': request.start_datetime, 'timeZone': 'UTC'},
-            'end': {'dateTime': request.end_datetime, 'timeZone': 'UTC'},
-            'attendees': attendees
+            "summary": request.summary,
+            "description": request.description,
+            "start": {"dateTime": start_iso, "timeZone": "Asia/Kolkata"},
+            "end": {"dateTime": end_iso, "timeZone": "Asia/Kolkata"},
+            "attendees": [{"email": email} for email in request.attendees or []]
         }
-        created_event = calendar.events().insert(calendarId='primary', body=event, sendUpdates='all').execute()
-        return {
-            "status": "Event created",
-            "eventId": created_event.get('id'),
-            "htmlLink": created_event.get('htmlLink')
-        }
-    except HttpError as e:
-        logger.error(f"Failed to create event: {e}")
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid event parameters: {str(e)}")
+        
+        # Log the event being sent to Google Calendar API
+        logger.info(f"Creating event with data: {json.dumps(event)}")
+        
+        created_event = calendar.events().insert(calendarId="primary", body=event).execute()
+        
+        # Log the created event response
+        logger.info(f"Created event response: {json.dumps(created_event)}")
+        
+        return {"status": "Event created", "eventId": created_event["id"]}
     except Exception as e:
         logger.error(f"Error creating event: {e}")
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to create event: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
 async def health_check():
@@ -314,7 +254,7 @@ async def health_check():
         return {"status": "healthy", "message": "Services are running normally"}
     except Exception as e:
         logger.error(f"Health check failed: {e}")
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=f"Service unavailable: {str(e)}")
+        raise HTTPException(status_code=503, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn

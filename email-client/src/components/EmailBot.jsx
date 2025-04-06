@@ -1,6 +1,7 @@
 // ... imports stay the same
 import React, { useState, useEffect } from 'react';
 import axios from 'axios';
+import dayjs from "dayjs";
 import {
   Box, Card, CardContent, Typography, List, ListItem, ListItemText,
   Button, CircularProgress, Alert, TextField, Dialog, DialogTitle,
@@ -57,37 +58,55 @@ const EmailBot = () => {
       showSnackbar('Failed to send email', 'error');
     }
   };
-
   const createEventFromEmail = async (email) => {
-    if (!email.potentialDates?.length) {
-      showSnackbar('No dates found in this email', 'warning');
-      return;
-    }
-
     try {
-      const dateString = email.potentialDates[0];
-      const eventDate = new Date(dateString);
-      if (isNaN(eventDate.getTime())) {
-        showSnackbar('Invalid date format', 'error');
+      const response = await axios.post(`${API_BASE_URL}/extract-dates`, {
+        snippet: email.snippet
+      });
+    
+      const potentialDates = response.data.dates;
+      if (!potentialDates || potentialDates.length === 0) {
+        showSnackbar("No dates found in this email", "warning");
         return;
       }
-
-      const endDate = new Date(eventDate);
-      endDate.setHours(endDate.getHours() + 1);
-
-      await axios.post(`${API_BASE_URL}/create-event`, {
-        summary: `Meeting regarding: ${email.subject}`,
-        description: `From email from ${email.from}\n\n${email.snippet}`,
-        start_datetime: eventDate.toISOString(),
-        end_datetime: endDate.toISOString(),
-        attendees: [email.from.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/)?.[0]]
+    
+      // Get user's timezone
+      const userTimezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+      
+      // Parse the ISO date string from the API
+      const parsedDate = dayjs(potentialDates[0]);
+      if (!parsedDate.isValid()) {
+        showSnackbar("Could not parse date", "error");
+        return;
+      }
+      
+      // Create event with the correct time (3pm-4pm)
+      // Format to ISO8601 with timezone offset to prevent conversion issues
+      const eventStart = parsedDate.hour(15).minute(0).second(0).toISOString();
+      const eventEnd = parsedDate.hour(16).minute(0).second(0).toISOString();
+      
+    
+      console.log("Creating event with times:", {
+        start: eventStart,
+        end: eventEnd,
+        timezone: userTimezone
       });
-
-      showSnackbar('Calendar event created', 'success');
-    } catch {
-      showSnackbar('Failed to create calendar event', 'error');
+    
+      await axios.post(`${API_BASE_URL}/create-event`, {
+        summary: email.subject,
+        description: email.snippet,
+        start_datetime: eventStart,
+        end_datetime: eventEnd,
+        timezone: userTimezone // Add timezone information
+      });
+    
+      showSnackbar("Event added to calendar", "success");
+    } catch (error) {
+      console.error("Error creating event:", error);
+      showSnackbar("Failed to create event", "error");
     }
   };
+  
 
   const generateWithAI = async () => {
     if (!newEmail.subject) {
@@ -175,7 +194,8 @@ const EmailBot = () => {
             <DialogTitle>{selectedEmail.subject}</DialogTitle>
             <DialogContent>
               <Typography variant="body2" color="textSecondary"><strong>From:</strong> {selectedEmail.from}</Typography>
-              <Typography variant="body2" color="textSecondary"><strong>Date:</strong> {new Date(selectedEmail.date).toLocaleString()}</Typography>
+              <Typography variant="body2" color="textSecondary"><strong>Date:</strong> {dayjs(selectedEmail.date).format('D MMM YYYY, h:mm A')}</Typography>
+
               <Typography variant="body1" paragraph>{selectedEmail.snippet}</Typography>
 
               {selectedEmail.potentialDates?.length > 0 && (
